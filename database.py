@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -95,6 +97,7 @@ class VulnerabilityDB:
               classification TEXT NOT NULL CHECK(classification IN ('private','coordinator')),
               uploaded_by INTEGER NOT NULL REFERENCES users(id),
               created_at TEXT NOT NULL,
+              invalidated_at TEXT,
               UNIQUE(report_id, name)
             );
             CREATE TABLE IF NOT EXISTS fix_plans (
@@ -141,9 +144,24 @@ class VulnerabilityDB:
               created_at TEXT NOT NULL,
               published_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS public_previews (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL UNIQUE REFERENCES reports(id) ON DELETE CASCADE,
+              paragraph_indexes TEXT NOT NULL DEFAULT '[]',
+              evidence_ids TEXT NOT NULL DEFAULT '[]',
+              fingerprint TEXT NOT NULL,
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL
+            );
             """
         )
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(evidence)")}
+        if "invalidated_at" not in columns:
+            self.conn.execute("ALTER TABLE evidence ADD COLUMN invalidated_at TEXT")
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -281,6 +299,19 @@ class VulnerabilityDB:
                 raise DomainError("同一报告中的材料名称不能重复") from exc
         return int(cur.lastrowid)
 
+    def invalidate_evidence(self, evidence_id: int, user_id: int) -> None:
+        user = self._user(user_id)
+        row = self.conn.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+        if not row:
+            raise DomainError("材料不存在")
+        if user["role"] != "coordinator":
+            raise DomainError("只有协调员可以作废材料")
+        if row["invalidated_at"]:
+            raise DomainError("材料已失效")
+        with self.transaction():
+            self.conn.execute("UPDATE evidence SET invalidated_at=? WHERE id=?", (datetime.now().isoformat(), evidence_id))
+            self._notify(row["report_id"], row["uploaded_by"], "evidence", f"材料 {row['name']} 已作废，不会进入公开页")
+
     def get_report_for_user(self, report_id: int, user_id: int) -> dict:
         if not self.can_view(report_id, user_id):
             raise DomainError("无权查看该漏洞报告")
@@ -325,8 +356,8 @@ class VulnerabilityDB:
             )
             for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
                 self._notify(report_id, member["user_id"], "status", f"报告状态更新为 {new_status}")
-        if new_status == "published":
-            self._publish_advisory_if_ready(report_id, user_id, now)
+            if new_status == "published":
+                self._publish_advisory_if_ready(report_id, user_id, now)
 
     def set_fix_plan(self, report_id: int, maintainer_id: int, plan: str, target_date: str | None = None) -> int:
         user = self._user(maintainer_id)
@@ -410,6 +441,131 @@ class VulnerabilityDB:
                 draft_id = int(cur.lastrowid)
         return int(draft_id)
 
+    @staticmethod
+    def _split_paragraphs(content: str) -> list[str]:
+        return [p.strip() for p in re.split(r"\n\s*\n", content.strip()) if p.strip()]
+
+    @staticmethod
+    def _redact_summary(content: str, limit: int = 60) -> str:
+        text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "***", content)
+        text = re.sub(r"\d[\d\-+ ]{4,}\d", "***", text)
+        text = " ".join(text.split())
+        return text[:limit].rstrip() + "…" if len(text) > limit else text
+
+    def _preview_fingerprint(self, report_id: int) -> str:
+        report = self.conn.execute("SELECT title,summary,confidential_until FROM reports WHERE id=?", (report_id,)).fetchone()
+        draft = self.conn.execute("SELECT content FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
+        versions = self.conn.execute("SELECT version_key,details FROM affected_versions WHERE report_id=? ORDER BY id", (report_id,)).fetchall()
+        evidence = self.conn.execute("SELECT id,classification,invalidated_at FROM evidence WHERE report_id=? ORDER BY id", (report_id,)).fetchall()
+        payload = {
+            "report": dict(report) if report else None,
+            "draft": draft["content"] if draft else None,
+            "versions": [dict(row) for row in versions],
+            "evidence": [dict(row) for row in evidence],
+        }
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def create_public_preview(self, report_id: int, coordinator_id: int, paragraphs: list, evidence_ids: list) -> dict:
+        actor = self._user(coordinator_id)
+        if not self.conn.execute("SELECT 1 FROM reports WHERE id=?", (report_id,)).fetchone():
+            raise DomainError("报告不存在")
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以指定公开预览")
+        draft = self.conn.execute("SELECT * FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
+        if not draft:
+            raise DomainError("公告草稿不存在，无法生成公开预览")
+        available = self._split_paragraphs(draft["content"])
+        try:
+            indexes = sorted({int(i) for i in paragraphs})
+            eids = sorted({int(e) for e in evidence_ids})
+        except (TypeError, ValueError) as exc:
+            raise DomainError("段落序号和材料编号必须是整数") from exc
+        if not indexes:
+            raise DomainError("至少指定一个可公开段落")
+        if indexes[0] < 0 or indexes[-1] >= len(available):
+            raise DomainError("段落序号超出草稿范围")
+        for eid in eids:
+            ev = self.conn.execute("SELECT * FROM evidence WHERE id=? AND report_id=?", (eid, report_id)).fetchone()
+            if not ev:
+                raise DomainError(f"材料不存在: {eid}")
+            if ev["classification"] == "coordinator":
+                raise DomainError(f"协调员专用材料不能公开: {ev['name']}")
+            if ev["invalidated_at"]:
+                raise DomainError(f"已失效材料不能公开: {ev['name']}")
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO public_previews(report_id,paragraph_indexes,evidence_ids,fingerprint,created_by,created_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(report_id) DO UPDATE SET paragraph_indexes=excluded.paragraph_indexes,evidence_ids=excluded.evidence_ids,"
+                "fingerprint=excluded.fingerprint,created_by=excluded.created_by,created_at=excluded.created_at",
+                (report_id, json.dumps(indexes), json.dumps(eids), self._preview_fingerprint(report_id), coordinator_id, datetime.now().isoformat()),
+            )
+        return self._preview_state(report_id)
+
+    def _preview_state(self, report_id: int) -> dict | None:
+        preview = self.conn.execute("SELECT * FROM public_previews WHERE report_id=?", (report_id,)).fetchone()
+        if not preview:
+            return None
+        draft = self.conn.execute("SELECT * FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
+        paragraphs = self._split_paragraphs(draft["content"]) if draft else []
+        chosen = set(json.loads(preview["paragraph_indexes"]))
+        indexes = [i for i in chosen if 0 <= i < len(paragraphs)]
+        evidence_rows = self.conn.execute("SELECT * FROM evidence WHERE report_id=? ORDER BY id", (report_id,)).fetchall()
+        by_id = {row["id"]: row for row in evidence_rows}
+        materials = []
+        for eid in json.loads(preview["evidence_ids"]):
+            ev = by_id.get(eid)
+            if ev and ev["classification"] == "private" and not ev["invalidated_at"]:
+                materials.append({"id": ev["id"], "name": ev["name"], "summary": self._redact_summary(ev["content"])})
+        valid = preview["fingerprint"] == self._preview_fingerprint(report_id)
+        return {
+            "id": preview["id"],
+            "report_id": report_id,
+            "valid": valid,
+            "invalid_reason": None if valid else "报告或公告草稿已变更，公开预览已失效",
+            "paragraphs": [paragraphs[i] for i in sorted(indexes)],
+            "materials": materials,
+            "blockers": {
+                "paragraphs": [{"index": i, "excerpt": p[:40]} for i, p in enumerate(paragraphs) if i not in chosen],
+                "coordinator_evidence": [{"id": row["id"], "name": row["name"]} for row in evidence_rows if row["classification"] == "coordinator"],
+                "invalidated_evidence": [{"id": row["id"], "name": row["name"]} for row in evidence_rows if row["invalidated_at"]],
+            },
+            "created_by": preview["created_by"],
+            "created_at": preview["created_at"],
+        }
+
+    def get_public_preview(self, report_id: int, user_id: int) -> dict:
+        user = self._user(user_id)
+        if not self.conn.execute("SELECT 1 FROM reports WHERE id=?", (report_id,)).fetchone():
+            raise DomainError("报告不存在")
+        if user["role"] != "coordinator":
+            raise DomainError("只有协调员可以查看公开预览")
+        state = self._preview_state(report_id)
+        if not state:
+            raise DomainError("公开预览尚未生成")
+        return state
+
+    def _compose_public_advisory(self, report: sqlite3.Row, draft: sqlite3.Row) -> dict:
+        payload = {
+            "status": "published",
+            "public_id": report["public_id"],
+            "title": report["title"],
+            "versions": [dict(row) for row in self.conn.execute(
+                "SELECT version_key,details FROM affected_versions WHERE report_id=? ORDER BY id", (report["id"],)
+            )],
+            "published_at": draft["published_at"] or report["public_at"],
+            "preview_valid": False,
+            "paragraphs": [],
+            "content": "",
+            "materials": [],
+        }
+        preview = self._preview_state(report["id"])
+        if preview and preview["valid"]:
+            payload["preview_valid"] = True
+            payload["paragraphs"] = preview["paragraphs"]
+            payload["content"] = "\n\n".join(preview["paragraphs"])
+            payload["materials"] = preview["materials"]
+        return payload
+
     def _publish_advisory_if_ready(self, report_id: int, user_id: int, when: str) -> None:
         draft = self.conn.execute("SELECT * FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
         if not draft:
@@ -453,6 +609,11 @@ class VulnerabilityDB:
         payload["summary"] = report["summary"]
         if report["status"] != "published":
             payload["status"] = "draft"
+            return payload
+        public = self._compose_public_advisory(report, draft)
+        if not self.can_view(report_id, user_id):
+            return public
+        payload["public"] = public
         return payload
 
     def _notify(self, report_id: int, user_id: int, kind: str, message: str) -> None:

@@ -16,7 +16,7 @@ python app.py
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖：创建报告、加入维护者、分级、提交修复计划、解决、阻止提前披露、到期披露并读取公告；同时验证外部用户无权查看、相同产品版本会触发重复报告，以及维护者看不到协调员专用材料。
+测试覆盖：创建报告、加入维护者、分级、提交修复计划、解决、阻止提前披露、到期披露并读取公告；同时验证外部用户无权查看、相同产品版本会触发重复报告，维护者看不到协调员专用材料，以及公开预览的阻断清单、公开页只含指定段落与脱敏材料、报告或草稿改动使预览失效。
 
 ## 接口
 
@@ -26,8 +26,14 @@ python -m unittest discover -s tests -v
 - `POST /api/fixes`、`POST /api/extensions`
 - `POST /api/reports/{id}/status`
 - `POST /api/advisories`、`GET /api/reports/{id}/advisory?user_id=...`
+- `POST /api/reports/{id}/preview`、`GET /api/reports/{id}/preview?user_id=...`
+- `POST /api/evidence/{id}/invalidate`
 - `POST /api/reports/{id}/publish`
 - `GET /api/reports/{id}?user_id=...`
 - `GET /api/reports/{id}/notifications`
 
 状态流转限制为 `new -> triaged -> fixing -> resolved -> published`，拒绝或回到修复中也有显式规则。披露日期早于保密期限时请求会失败，不会只修改显示状态。
+
+## 公开预览
+
+公告不再整段公开。协调员用 `POST /api/reports/{id}/preview` 指定可公开段落（草稿按空行分段，序号从 0 开始）并勾选可公开材料；预览响应把未指定段落、协调员专用材料和已失效材料列为阻断项，勾选协调员专用或已失效材料会直接失败。`POST /api/evidence/{id}/invalidate` 由协调员作废材料。保密期到达并披露后，公开公告只组合标题、受影响版本和指定段落，材料仅显示名称与脱敏摘要（邮箱、长串数字打码并截断）。报告内容、材料或公告草稿改动会使预览指纹失效，公开页随即停用原预览，需协调员重新生成。

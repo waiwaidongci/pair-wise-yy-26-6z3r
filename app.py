@@ -32,6 +32,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200,{"notifications":self.db.notifications_for(int(parts[2]))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="advisory":
                 uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_advisory(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="preview":
+                uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_public_preview(int(parts[2]),uid))
             if parsed.path=="/api/duplicates":
                 q=parse_qs(parsed.query); return self._json(200,{"duplicates":self.db.find_duplicate_reports(int(q.get("product_id",[0])[0]),q.get("version",[""])[0])})
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -50,6 +52,8 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/advisories": return self._json(201,{"ok":True,"id":self.db.create_advisory_draft(int(b.get("report_id",0)),str(b.get("content","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="status": self.db.set_status(int(parts[2]),str(b.get("status","")),int(b.get("user_id",0)),str(b.get("note",""))); return self._json(200,{"ok":True})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="publish": self.db.publish_report(int(parts[2]),int(b.get("coordinator_id",0)),b.get("as_of")); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="preview": return self._json(201,self.db.create_public_preview(int(parts[2]),int(b.get("coordinator_id",0)),b.get("paragraphs",[]),b.get("evidence",[])))
+            if len(parts)==4 and parts[:2]==["api","evidence"] and parts[3]=="invalidate": self.db.invalidate_evidence(int(parts[2]),int(b.get("user_id",0))); return self._json(200,{"ok":True})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 
